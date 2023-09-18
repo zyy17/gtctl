@@ -15,25 +15,45 @@
 package k8s
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"os"
+	"path"
 	"strings"
 	"time"
 
 	greptimedbclusterv1alpha1 "github.com/GreptimeTeam/greptimedb-operator/apis/v1alpha1"
+	"gopkg.in/yaml.v3"
+	helmKube "helm.sh/helm/v3/pkg/kube"
 
 	. "github.com/GreptimeTeam/gtctl/pkg/deployer"
+	"github.com/GreptimeTeam/gtctl/pkg/deployer/baremetal/config"
 	"github.com/GreptimeTeam/gtctl/pkg/helm"
 	"github.com/GreptimeTeam/gtctl/pkg/kube"
 	"github.com/GreptimeTeam/gtctl/pkg/logger"
+	fileutils "github.com/GreptimeTeam/gtctl/pkg/utils/file"
 )
 
 type deployer struct {
-	helmManager *helm.Manager
-	client      *kube.Client
-	timeout     time.Duration
-	logger      logger.Logger
-	dryRun      bool
+	helmManager    *helm.Manager
+	client         *kube.Client
+	helmKubeClient *helmKube.Client
+	timeout        time.Duration
+	logger         logger.Logger
+	dryRun         bool
+}
+
+type deploymentMeta struct {
+	Values                 helm.Values `yaml:"values"`
+	Chart                  string      `yaml:"chart"`
+	Version                string      `yaml:"version"`
+	Name                   string      `yaml:"name"`
+	Namespace              string      `yaml:"namespace"`
+	Service                string      `yaml:"service"`
+	UseGreptimeCNArtifacts bool        `yaml:"useGreptimeCNArtifacts"`
+	Manifests              string      `yaml:"manifests"`
 }
 
 const (
@@ -67,7 +87,13 @@ func NewDeployer(l logger.Logger, opts ...Option) (Interface, error) {
 		}
 	}
 
+	helmKubeClient := helmKube.New(&genericclioptions.ConfigFlags{})
+	if err := helmKubeClient.IsReachable(); err != nil {
+		return nil, err
+	}
+
 	d.client = client
+	d.helmKubeClient = helmKubeClient
 
 	return d, nil
 }
@@ -126,7 +152,7 @@ func (d *deployer) CreateGreptimeDBCluster(ctx context.Context, name string, opt
 		options.ConfigValues += fmt.Sprintf("image.registry=%s,initializer.registry=%s,", AliCloudRegistry, AliCloudRegistry)
 	}
 
-	helmValues, err := helm.ToHelmValues(options, "")
+	helmValues, err := helm.ToHelmValues(*options, "")
 	if err != nil {
 		return err
 	}
@@ -141,11 +167,31 @@ func (d *deployer) CreateGreptimeDBCluster(ctx context.Context, name string, opt
 		return nil
 	}
 
-	if err := d.client.Apply(ctx, manifests); err != nil {
+	dm := &deploymentMeta{
+		Values:                 helmValues,
+		Chart:                  helm.GreptimeDBChartName,
+		Version:                options.GreptimeDBChartVersion,
+		Namespace:              resourceNamespace,
+		Name:                   resourceName,
+		Service:                "greptimedb-cluster",
+		UseGreptimeCNArtifacts: options.UseGreptimeCNArtifacts,
+		Manifests:              string(manifests),
+	}
+	if err := d.storeDeploymentMeta(dm); err != nil {
 		return err
 	}
 
-	return d.client.WaitForClusterReady(ctx, resourceName, resourceNamespace, d.timeout)
+	resources, err := d.helmKubeClient.Build(bytes.NewBuffer(manifests), false)
+	if err != nil {
+		return err
+	}
+
+	_, err = d.helmKubeClient.Create(resources)
+	if err != nil {
+		return err
+	}
+
+	return d.helmKubeClient.Wait(resources, d.timeout)
 }
 
 func (d *deployer) UpdateGreptimeDBCluster(ctx context.Context, name string, options *UpdateGreptimeDBClusterOptions) error {
@@ -171,7 +217,23 @@ func (d *deployer) DeleteGreptimeDBCluster(ctx context.Context, name string, opt
 	if err != nil {
 		return err
 	}
-	return d.client.DeleteCluster(ctx, resourceName, resourceNamespace)
+
+	dm, err := d.getDeploymentMeta("greptimedb-cluster", resourceNamespace, resourceName)
+	if err != nil {
+		return err
+	}
+
+	resources, err := d.helmKubeClient.Build(bytes.NewBufferString(dm.Manifests), false)
+	if err != nil {
+		return err
+	}
+
+	_, errors := d.helmKubeClient.Delete(resources)
+	if len(errors) != 0 {
+		return fmt.Errorf("error while deleting cluster: %v", errors)
+	}
+
+	return d.helmKubeClient.WaitForDelete(resources, 10*time.Minute)
 }
 
 func (d *deployer) CreateEtcdCluster(ctx context.Context, name string, options *CreateEtcdClusterOptions) error {
@@ -190,9 +252,14 @@ func (d *deployer) CreateEtcdCluster(ctx context.Context, name string, options *
 		options.ConfigValues += fmt.Sprintf("image.registry=%s,", AliCloudRegistry)
 	}
 
-	helmValues, err := helm.ToHelmValues(options, "")
+	helmValues, err := helm.ToHelmValues(*options, "")
 	if err != nil {
 		return err
+	}
+
+	dm, err := d.getDeploymentMeta("etcd", resourceNamespace, resourceName)
+	if dm != nil { // If the cluster already exists, we should update it.
+		return nil
 	}
 
 	manifests, err := d.helmManager.LoadAndRenderChart(ctx, resourceName, resourceNamespace, helm.EtcdBitnamiOCIRegistry, helm.DefaultEtcdChartVersion, options.UseGreptimeCNArtifacts, helmValues)
@@ -205,11 +272,31 @@ func (d *deployer) CreateEtcdCluster(ctx context.Context, name string, options *
 		return nil
 	}
 
-	if err = d.client.Apply(ctx, manifests); err != nil {
-		return fmt.Errorf("error while applying helm chart: %v", err)
+	dm = &deploymentMeta{
+		Values:                 helmValues,
+		Chart:                  helm.EtcdBitnamiOCIRegistry,
+		Version:                helm.DefaultEtcdChartVersion,
+		Namespace:              resourceNamespace,
+		Name:                   resourceName,
+		Service:                "etcd",
+		UseGreptimeCNArtifacts: options.UseGreptimeCNArtifacts,
+		Manifests:              string(manifests),
+	}
+	if err := d.storeDeploymentMeta(dm); err != nil {
+		return err
 	}
 
-	return d.client.WaitForEtcdReady(ctx, resourceName, resourceNamespace, d.timeout)
+	resources, err := d.helmKubeClient.Build(bytes.NewBuffer(manifests), false)
+	if err != nil {
+		return err
+	}
+
+	_, err = d.helmKubeClient.Create(resources)
+	if err != nil {
+		return err
+	}
+
+	return d.helmKubeClient.Wait(resources, d.timeout)
 }
 
 func (d *deployer) DeleteEtcdCluster(ctx context.Context, name string, options *DeleteEtcdClusterOption) error {
@@ -218,7 +305,22 @@ func (d *deployer) DeleteEtcdCluster(ctx context.Context, name string, options *
 		return err
 	}
 
-	return d.client.DeleteEtcdCluster(ctx, resourceName, resourceNamespace)
+	dm, err := d.getDeploymentMeta("etcd", resourceNamespace, resourceName)
+	if err != nil {
+		return err
+	}
+
+	resources, err := d.helmKubeClient.Build(bytes.NewBufferString(dm.Manifests), false)
+	if err != nil {
+		return err
+	}
+
+	_, errors := d.helmKubeClient.Delete(resources)
+	if len(errors) != 0 {
+		return fmt.Errorf("error while deleting cluster: %v", errors)
+	}
+
+	return d.helmKubeClient.WaitForDelete(resources, 10*time.Minute)
 }
 
 func (d *deployer) CreateGreptimeDBOperator(ctx context.Context, name string, options *CreateGreptimeDBOperatorOptions) error {
@@ -231,9 +333,14 @@ func (d *deployer) CreateGreptimeDBOperator(ctx context.Context, name string, op
 		options.ConfigValues += fmt.Sprintf("image.registry=%s,", AliCloudRegistry)
 	}
 
-	helmValues, err := helm.ToHelmValues(options, "")
+	helmValues, err := helm.ToHelmValues(*options, "")
 	if err != nil {
 		return err
+	}
+
+	dm, err := d.getDeploymentMeta("greptimedb-operator", resourceNamespace, resourceName)
+	if dm != nil { // If the cluster already exists, we should update it.
+		return nil
 	}
 
 	manifests, err := d.helmManager.LoadAndRenderChart(ctx, resourceName, resourceNamespace, helm.GreptimeDBOperatorChartName, options.GreptimeDBOperatorChartVersion, options.UseGreptimeCNArtifacts, helmValues)
@@ -246,11 +353,31 @@ func (d *deployer) CreateGreptimeDBOperator(ctx context.Context, name string, op
 		return nil
 	}
 
-	if err := d.client.Apply(ctx, manifests); err != nil {
+	dm = &deploymentMeta{
+		Values:                 helmValues,
+		Chart:                  helm.GreptimeDBOperatorChartName,
+		Version:                options.GreptimeDBOperatorChartVersion,
+		Namespace:              resourceNamespace,
+		Name:                   resourceName,
+		Service:                "greptimedb-operator",
+		UseGreptimeCNArtifacts: options.UseGreptimeCNArtifacts,
+		Manifests:              string(manifests),
+	}
+	if err := d.storeDeploymentMeta(dm); err != nil {
 		return err
 	}
 
-	return d.client.WaitForDeploymentReady(ctx, resourceName, resourceNamespace, d.timeout)
+	resources, err := d.helmKubeClient.Build(bytes.NewBuffer(manifests), false)
+	if err != nil {
+		return err
+	}
+
+	_, err = d.helmKubeClient.Create(resources)
+	if err != nil {
+		return err
+	}
+
+	return d.helmKubeClient.Wait(resources, d.timeout)
 }
 
 func (d *deployer) splitNamescapedName(name string) (string, string, error) {
@@ -264,4 +391,53 @@ func (d *deployer) splitNamescapedName(name string) (string, string, error) {
 	}
 
 	return split[0], split[1], nil
+}
+
+func (d *deployer) storeDeploymentMeta(dm *deploymentMeta) error {
+	data, err := yaml.Marshal(dm)
+	if err != nil {
+		return err
+	}
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+
+	valuesFile := path.Join(homeDir, config.GtctlDir, dm.Service, fmt.Sprintf("%s_%s", dm.Namespace, dm.Name), "deployment.yaml")
+
+	if err := fileutils.CreateDirIfNotExists(path.Dir(valuesFile)); err != nil {
+		return err
+	}
+
+	f, err := os.Create(valuesFile)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (d *deployer) getDeploymentMeta(service, namespace, name string) (*deploymentMeta, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+
+	valuesFile := path.Join(homeDir, config.GtctlDir, service, fmt.Sprintf("%s_%s", namespace, name), "deployment.yaml")
+
+	data, err := os.ReadFile(valuesFile)
+	if err != nil {
+		return nil, err
+	}
+
+	var dm deploymentMeta
+	if err := yaml.Unmarshal(data, &dm); err != nil {
+		return nil, err
+	}
+
+	return &dm, nil
 }
