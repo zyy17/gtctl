@@ -18,12 +18,9 @@ import (
 	"context"
 	"os"
 	"sort"
-	"strings"
 	"testing"
 
 	"github.com/Masterminds/semver"
-	"github.com/google/go-cmp/cmp"
-	"helm.sh/helm/v3/pkg/strvals"
 	"sigs.k8s.io/kind/pkg/log"
 
 	"github.com/GreptimeTeam/gtctl/pkg/deployer"
@@ -76,7 +73,11 @@ func TestLoadAndRenderChart(t *testing.T) {
 	ctx := context.Background()
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			manifests, err := r.LoadAndRenderChart(ctx, tt.name, tt.namespace, tt.chartName, tt.chartVersion, false, tt.values)
+			values, err := ToHelmValues(tt.values, "")
+			if err != nil {
+				t.Errorf("failed to convert values: %v", err)
+			}
+			manifests, err := r.LoadAndRenderChart(ctx, tt.name, tt.namespace, tt.chartName, tt.chartVersion, false, values)
 			if err != nil {
 				t.Errorf("failed to load and render chart: %v", err)
 			}
@@ -163,127 +164,6 @@ func TestRender_GetLatestChartLatestChart(t *testing.T) {
 				t.Errorf("latest chart version not match, expect: %s, got: %s", vs[len(vs)-1].String(), chart.Version)
 			}
 		})
-	}
-}
-
-func TestRender_GenerateGreptimeDBHelmValues(t *testing.T) {
-	r, err := NewManager(logger.New(os.Stdout, log.Level(4), logger.WithColored()),
-		WithChartsCacheDir(testChartsCacheDir))
-	if err != nil {
-		t.Errorf("failed to create render: %v", err)
-	}
-	defer cleanChartsCache()
-
-	options := deployer.CreateGreptimeDBClusterOptions{
-		GreptimeDBChartVersion:      "",
-		ImageRegistry:               "registry.cn-hangzhou.aliyuncs.com",
-		DatanodeStorageClassName:    "ebs-sc",
-		DatanodeStorageSize:         "11Gi",
-		DatanodeStorageRetainPolicy: "Delete",
-		EtcdEndPoint:                "127.0.0.1:2379",
-		InitializerImageRegistry:    "registry.cn-hangzhou.aliyuncs.com",
-		ConfigValues:                "meta.replicas=4",
-	}
-
-	values, err := r.generateHelmValues(options)
-	if err != nil {
-		t.Errorf("generate greptimedb helm values failed, err: %v", err)
-	}
-
-	ArgsStr := []string{
-		"image.registry=registry.cn-hangzhou.aliyuncs.com",
-		"datanode.storage.storageClassName=ebs-sc",
-		"datanode.storage.storageSize=11Gi",
-		"datanode.storage.storageRetainPolicy=Delete",
-		"etcdEndpoints=127.0.0.1:2379",
-		"initializer.registry=registry.cn-hangzhou.aliyuncs.com",
-		"meta.replicas=4",
-	}
-
-	valuesWanted, err := strvals.Parse(strings.Join(ArgsStr, ","))
-	if err != nil {
-		t.Errorf("parse greptimedb helm values failed, err: %v", err)
-	}
-
-	if !cmp.Equal(values, valuesWanted) {
-		t.Errorf("generate greptimedb helm values not match, expect: %v, got: %v", valuesWanted, values)
-		t.Errorf("diff: %v", cmp.Diff(valuesWanted, values))
-	}
-}
-
-func TestRender_GenerateGreptimeDBOperatorHelmValues(t *testing.T) {
-	r, err := NewManager(logger.New(os.Stdout, log.Level(4), logger.WithColored()),
-		WithChartsCacheDir(testChartsCacheDir))
-	if err != nil {
-		t.Errorf("failed to create render: %v", err)
-	}
-	defer cleanChartsCache()
-
-	options := deployer.CreateGreptimeDBOperatorOptions{
-		GreptimeDBOperatorChartVersion: "",
-		ImageRegistry:                  "registry.cn-hangzhou.aliyuncs.com",
-		ConfigValues:                   "replicas=3",
-	}
-
-	values, err := r.generateHelmValues(options)
-	if err != nil {
-		t.Errorf("generate greptimedb operator helm values failed, err: %v", err)
-	}
-
-	ArgsStr := []string{
-		"image.registry=registry.cn-hangzhou.aliyuncs.com",
-		"replicas=3",
-	}
-
-	valuesWanted, err := strvals.Parse(strings.Join(ArgsStr, ","))
-	if err != nil {
-		t.Errorf("parse greptimedb operator helm values failed, err: %v", err)
-	}
-
-	if !cmp.Equal(values, valuesWanted) {
-		t.Errorf("generate greptimedb operator helm values not match, expect: %v, got: %v", valuesWanted, values)
-		t.Errorf("diff: %v", cmp.Diff(valuesWanted, values))
-	}
-}
-
-func TestRender_GenerateEtcdHelmValues(t *testing.T) {
-	r, err := NewManager(logger.New(os.Stdout, log.Level(4), logger.WithColored()),
-		WithChartsCacheDir(testChartsCacheDir))
-	if err != nil {
-		t.Errorf("failed to create render: %v", err)
-	}
-	defer cleanChartsCache()
-
-	options := deployer.CreateEtcdClusterOptions{
-		EtcdChartVersion:     "",
-		ImageRegistry:        "registry.cn-hangzhou.aliyuncs.com",
-		EtcdStorageClassName: "ebs-sc",
-		EtcdStorageSize:      "11Gi",
-		EtcdClusterSize:      "3",
-		ConfigValues:         "image.tag=latest",
-	}
-
-	values, err := r.generateHelmValues(options)
-	if err != nil {
-		t.Errorf("generate etcd helm values failed, err: %v", err)
-	}
-
-	ArgsStr := []string{
-		"image.registry=registry.cn-hangzhou.aliyuncs.com",
-		"persistence.storageClass=ebs-sc",
-		"persistence.size=11Gi",
-		"replicaCount=3",
-		"image.tag=latest",
-	}
-
-	valuesWanted, err := strvals.Parse(strings.Join(ArgsStr, ","))
-	if err != nil {
-		t.Errorf("parse etcd helm values failed, err: %v", err)
-	}
-
-	if !cmp.Equal(values, valuesWanted) {
-		t.Errorf("generate etcd helm values not match, expect: %v, got: %v", valuesWanted, values)
-		t.Errorf("diff: %v", cmp.Diff(valuesWanted, values))
 	}
 }
 

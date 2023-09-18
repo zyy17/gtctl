@@ -25,7 +25,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"reflect"
 	"strings"
 
 	"helm.sh/helm/v3/pkg/action"
@@ -35,15 +34,10 @@ import (
 	"helm.sh/helm/v3/pkg/cli"
 	"helm.sh/helm/v3/pkg/registry"
 	. "helm.sh/helm/v3/pkg/repo"
-	"helm.sh/helm/v3/pkg/strvals"
 	"sigs.k8s.io/yaml"
 
 	"github.com/GreptimeTeam/gtctl/pkg/logger"
 	fileutils "github.com/GreptimeTeam/gtctl/pkg/utils/file"
-)
-
-const (
-	helmFieldTag = "helm"
 )
 
 var (
@@ -96,14 +90,12 @@ func WithChartsCacheDir(chartsCacheDir string) func(*Manager) {
 }
 
 // LoadAndRenderChart loads the chart from the remote charts and render the manifests with the values.
-func (r *Manager) LoadAndRenderChart(ctx context.Context, name, namespace, chartName, chartVersion string, useGreptimeCNArtifacts bool, options interface{}) ([]byte, error) {
-	values, err := r.generateHelmValues(options)
-	if err != nil {
-		return nil, err
-	}
-	r.logger.V(3).Infof("create '%s' with values: %v", name, values)
+func (r *Manager) LoadAndRenderChart(ctx context.Context, name, namespace, chartName, chartVersion string, useGreptimeCNArtifacts bool, values Values) ([]byte, error) {
+	var (
+		helmChart *chart.Chart
+		err       error
+	)
 
-	var helmChart *chart.Chart
 	if isOCIChar(chartName) {
 		helmChart, err = r.pullFromOCIRegistry(chartName, chartVersion)
 		if err != nil {
@@ -196,38 +188,6 @@ func (r *Manager) generateManifests(ctx context.Context, releaseName, namespace 
 	}
 
 	return manifests.Bytes(), nil
-}
-
-func (r *Manager) generateHelmValues(input interface{}) (map[string]interface{}, error) {
-	var rawArgs []string
-	valueOf := reflect.ValueOf(input)
-
-	// Make sure we are handling with a struct here.
-	if valueOf.Kind() != reflect.Struct {
-		return nil, fmt.Errorf("invalid input type, should be struct")
-	}
-
-	typeOf := reflect.TypeOf(input)
-	for i := 0; i < valueOf.NumField(); i++ {
-		helmValueKey := typeOf.Field(i).Tag.Get(helmFieldTag)
-		if len(helmValueKey) > 0 && valueOf.Field(i).Len() > 0 {
-			if helmValueKey == "*" {
-				rawArgs = append(rawArgs, valueOf.Field(i).String())
-			} else {
-				rawArgs = append(rawArgs, fmt.Sprintf("%s=%s", helmValueKey, valueOf.Field(i)))
-			}
-		}
-	}
-
-	if len(rawArgs) > 0 {
-		values := make(map[string]interface{})
-		if err := strvals.ParseInto(strings.Join(rawArgs, ","), values); err != nil {
-			return nil, err
-		}
-		return values, nil
-	}
-
-	return nil, nil
 }
 
 func (r *Manager) getLatestChart(indexFile *IndexFile, chartName string) (*ChartVersion, error) {
